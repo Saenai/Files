@@ -24,7 +24,7 @@ jobs:
       - name: Build sideload package
         shell: pwsh
         run: |
-          msbuild "src\Files.App (Package)\Files.Package.wapproj\Files.Package.wapproj" `
+          msbuild "src\Files.App (Package)\Files.Package.wapproj" `
             /restore `
             /p:Configuration=Release `
             /p:Platform=x64 `
@@ -37,5 +37,5 @@ jobs:
         with:
           name: Files-sideload-x64
           path: |
-            src\Files.App (Package)\Files.Package.wapproj\AppPackages\**\*
-            src\Files.App (Package)\Files.Package.wapproj\bin\**\*
+            src\Files.App (Package)\bin\**\*
+            src\Files.App (Package)\AppPackages\**\*
