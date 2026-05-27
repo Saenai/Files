@@ -15,11 +15,16 @@ jobs:
           dotnet-version: 10.0.x
 
       - uses: microsoft/setup-msbuild@v2
-
+      
+      - name: Locate package projects
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -Filter *.wapproj | Select-Object -ExpandProperty FullName
+          
       - name: Build sideload package
         shell: pwsh
         run: |
-          msbuild "src\Files.App (Package)\Files.Package.wapproj" `
+          msbuild "src\Files.App (Package)\Files.Package.wapproj\Files.Package.wapproj" `
             /restore `
             /p:Configuration=Release `
             /p:Platform=x64 `
@@ -32,4 +37,5 @@ jobs:
         with:
           name: Files-sideload-x64
           path: |
-            src\Files.App (Package)\AppPackages\**\*
+            src\Files.App (Package)\Files.Package.wapproj\AppPackages\**\*
+            src\Files.App (Package)\Files.Package.wapproj\bin\**\*
