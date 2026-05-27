@@ -1,41 +1,189 @@
-name: Build Sideload Package
+name: Build Sideload Preview Fork
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
+
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Release]
+        platform: [x64]
+
+    env:
+      SOLUTION_NAME: Files.slnx
+      CONFIGURATION: ${{ matrix.configuration }}
+      PLATFORM: ${{ matrix.platform }}
+      APPX_BUNDLE_PLATFORMS: x64|arm64
+      WORKING_DIR: ${{ github.workspace }}
+      ARTIFACTS_STAGING_DIR: ${{ github.workspace }}\artifacts
+      APPX_PACKAGE_DIR: ${{ github.workspace }}\artifacts\AppxPackages\
+      APP_PROJECT_PATH: src\Files.App\Files.App.csproj
+      PACKAGE_MANIFEST_PATH: src\Files.App\Package.appxmanifest
+      LAUNCHER_PROJECT_PATH: src\Files.App.Launcher\Files.App.Launcher.vcxproj
+      APP_INSTALLER_SIDELOAD_URL: https://example.invalid/files/preview/
+      CERT_SUBJECT: CN=FilesForkSideload
+      CERT_PASSWORD: files-fork-temporary-password
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout the repository
+        uses: actions/checkout@v6
 
-      - uses: actions/setup-dotnet@v4
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v3
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: 10.0.x
+          global-json-file: global.json
 
-      - uses: microsoft/setup-msbuild@v2
-      
-      - name: Locate package projects
+      - name: Create temporary signing certificate
         shell: pwsh
         run: |
-          Get-ChildItem -Recurse -Filter *.wapproj | Select-Object -ExpandProperty FullName
-          
-      - name: Build sideload package
+          New-Item -ItemType Directory -Force "$env:ARTIFACTS_STAGING_DIR\cert" | Out-Null
+
+          $cert = New-SelfSignedCertificate `
+            -Type CodeSigningCert `
+            -Subject "$env:CERT_SUBJECT" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -KeyAlgorithm RSA `
+            -KeyLength 2048 `
+            -HashAlgorithm SHA256 `
+            -NotAfter (Get-Date).AddYears(2)
+
+          $securePassword = ConvertTo-SecureString "$env:CERT_PASSWORD" -AsPlainText -Force
+
+          Export-PfxCertificate `
+            -Cert $cert `
+            -FilePath "$env:ARTIFACTS_STAGING_DIR\cert\FilesForkSideload.pfx" `
+            -Password $securePassword | Out-Null
+
+          Export-Certificate `
+            -Cert $cert `
+            -FilePath "$env:ARTIFACTS_STAGING_DIR\cert\FilesForkSideload.cer" | Out-Null
+
+          "CERT_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
+          "CERT_PFX=$env:ARTIFACTS_STAGING_DIR\cert\FilesForkSideload.pfx" >> $env:GITHUB_ENV
+          "CERT_CER=$env:ARTIFACTS_STAGING_DIR\cert\FilesForkSideload.cer" >> $env:GITHUB_ENV
+
+      - name: Configure package manifest
         shell: pwsh
         run: |
-          msbuild "src\Files.App (Package)\Files.Package.wapproj" `
-            /restore `
-            /p:Configuration=Release `
-            /p:Platform=x64 `
-            /p:GenerateAppxPackageOnBuild=true `
-            /p:AppxBundle=Never `
-            /p:UapAppxPackageBuildMode=SideloadOnly `
-            /p:AppxPackageSigningEnabled=false
+          . './.github/scripts/Configure-AppxManifest.ps1' `
+            -Branch "SideloadPreview" `
+            -PackageManifestPath "$env:PACKAGE_MANIFEST_PATH" `
+            -Publisher "$env:CERT_SUBJECT" `
+            -WorkingDir "$env:WORKING_DIR" `
+            -SecretBingMapsKey "" `
+            -SecretSentry "" `
+            -SecretGitHubOAuthClientId ""
 
-      - uses: actions/upload-artifact@v4
+      - name: Restore Files
+        shell: pwsh
+        run: |
+          msbuild "$env:SOLUTION_NAME" `
+            -t:Restore `
+            -p:Platform=$env:PLATFORM `
+            -p:Configuration=$env:CONFIGURATION `
+            -p:PublishReadyToRun=true `
+            -v:minimal
+
+      - name: Restore NuGet packages for launcher project
+        shell: pwsh
+        run: |
+          nuget restore "$env:LAUNCHER_PROJECT_PATH" `
+            -SolutionDirectory "$env:WORKING_DIR" `
+            -Verbosity detailed
+
+      - name: Build launcher project
+        shell: pwsh
+        run: |
+          msbuild "$env:LAUNCHER_PROJECT_PATH" `
+            -t:Build `
+            -p:Platform=$env:PLATFORM `
+            -p:Configuration=$env:CONFIGURATION `
+            -v:minimal
+
+      - name: Sign launcher EXE with temporary certificate
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\\x64\\signtool.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+
+          if (-not $signtool) {
+            throw "signtool.exe not found"
+          }
+
+          Get-ChildItem "$env:WORKING_DIR\src\Files.App\Assets\FilesOpenDialog" -Filter *.exe | ForEach-Object {
+            & $signtool.FullName sign /fd SHA256 /f "$env:CERT_PFX" /p "$env:CERT_PASSWORD" $_.FullName
+          }
+
+      - name: Build and package Files
+        shell: pwsh
+        run: |
+          $platforms = "$env:APPX_BUNDLE_PLATFORMS" -split '\|'
+
+          foreach ($plat in $platforms) {
+            Write-Host "Building for $plat..."
+
+            msbuild "$env:APP_PROJECT_PATH" `
+              -t:Build `
+              -p:Platform=$plat `
+              -p:Configuration=$env:CONFIGURATION `
+              -p:AppxPackageDir="$env:APPX_PACKAGE_DIR" `
+              -p:AppxBundle=Never `
+              -p:GenerateAppxPackageOnBuild=true `
+              -p:UapAppxPackageBuildMode=Sideload `
+              -p:AppxPackageSigningEnabled=true `
+              -p:PackageCertificateKeyFile="$env:CERT_PFX" `
+              -p:PackageCertificatePassword="$env:CERT_PASSWORD" `
+              -v:minimal
+          }
+
+      - name: Create msixbundle and appinstaller
+        shell: pwsh
+        run: |
+          . './.github/scripts/Create-MsixBundle.ps1' `
+            -AppxPackageDir "$env:APPX_PACKAGE_DIR" `
+            -BundleName "Files.Package" `
+            -PackageManifestPath "$env:PACKAGE_MANIFEST_PATH" `
+            -AppInstallerUri "$env:APP_INSTALLER_SIDELOAD_URL" `
+            -BuildMode "Sideload"
+
+      - name: Sign MSIX packages with temporary certificate
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\\x64\\signtool.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+
+          if (-not $signtool) {
+            throw "signtool.exe not found"
+          }
+
+          Get-ChildItem "$env:APPX_PACKAGE_DIR" -Recurse -Include *.msix,*.msixbundle,*.appx,*.appxbundle | ForEach-Object {
+            Write-Host "Signing $($_.FullName)"
+            & $signtool.FullName sign /fd SHA256 /f "$env:CERT_PFX" /p "$env:CERT_PASSWORD" $_.FullName
+          }
+
+      - name: Remove empty files from packages
+        shell: pwsh
+        run: |
+          Get-ChildItem "$env:ARTIFACTS_STAGING_DIR" -Recurse -File |
+            Where-Object { $_.Length -eq 0 } |
+            Remove-Item -Force
+
+      - name: Upload packages to GitHub Actions
+        uses: actions/upload-artifact@v4
         with:
-          name: Files-sideload-x64
-          path: |
-            src\Files.App (Package)\bin\**\*
-            src\Files.App (Package)\AppPackages\**\*
+          name: Files-sideload-preview-fork
+          path: ${{ env.ARTIFACTS_STAGING_DIR }}
